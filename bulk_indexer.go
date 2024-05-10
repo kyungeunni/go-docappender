@@ -89,9 +89,11 @@ type BulkIndexer struct {
 }
 
 type BulkIndexerResponseStat struct {
-	Indexed     int64
-	RetriedDocs int64
-	FailedDocs  []BulkIndexerResponseItem
+	Indexed                    int64
+	RetriedDocs                int64
+	FailedDocs                 []BulkIndexerResponseItem
+	FlushedSuccess             int64
+	FlushedUncompressedSuccess int64
 }
 
 // BulkIndexerResponseItem represents the Elasticsearch response item.
@@ -356,10 +358,9 @@ func (b *BulkIndexer) Flush(ctx context.Context) (BulkIndexerResponseStat, error
 		return resp, fmt.Errorf("error decoding bulk response: %w", err)
 	}
 
-	// Only run the retry logic if document retries are enabled
-	if b.config.MaxDocumentRetries > 0 {
-		buf := make([]byte, 0, 4096)
-
+	retryEnabled := b.config.MaxDocumentRetries > 0
+	// retry is disabled and there are no failed docs
+	if retryEnabled {
 		// Eliminate previous retry counts that aren't present in the bulk
 		// request response.
 		for k := range b.retryCounts {
@@ -375,125 +376,154 @@ func (b *BulkIndexer) Flush(ctx context.Context) (BulkIndexerResponseStat, error
 				delete(b.retryCounts, k)
 			}
 		}
+	}
 
-		tmp := resp.FailedDocs[:0]
-		lastln := 0
-		lastIdx := 0
-		var gr *gzip.Reader
+	if len(resp.FailedDocs) == 0 {
+		resp.FlushedUncompressedSuccess = int64(b.bytesUncompFlushed)
+		resp.FlushedSuccess = int64(b.bytesFlushed)
+		return resp, nil
+	}
+
+	buf := make([]byte, 0, 4096)
+	tmp := resp.FailedDocs[:0]
+	lastln := 0
+	lastIdx := 0
+	var gr *gzip.Reader
+	var successTracker *gzip.Writer
+
+	if b.gzipw != nil {
+		gr, err = gzip.NewReader(bytes.NewReader(b.copyBuf))
+		if err != nil {
+			return resp, fmt.Errorf("failed to decompress request payload: %w", err)
+		}
+		defer gr.Close()
+		// count it and discard it
+		successTracker, _ = gzip.NewWriterLevel(io.Discard, b.config.CompressionLevel)
+		defer successTracker.Close()
+	}
+
+	// keep track of the previous newlines
+	// the buffer is being read lazily
+	seen := 0
+
+	for _, res := range resp.FailedDocs {
+		skipRetry := false
+		if !b.shouldRetryOnStatus(res.Status) {
+			skipRetry = true
+		}
+		// there are two lines for each document:
+		// - action
+		// - document
+		//
+		// Find the document by looking up the newline separators.
+		// First the newline (if exists) before the 'action' then the
+		// newline at the end of the 'document' line.
+		startln := res.Position * 2
+		endln := startln + 2
+
+		// Increment retry count for the positions found.
+		count := b.retryCounts[res.Position] + 1
+		// check if we are above the maxDocumentRetry setting
+		if count > b.config.MaxDocumentRetries {
+			// TODO: feed the count reader up until this.
+			// do not retry, return the document as failed
+			skipRetry = true
+		}
+
+		// Since some items may have succeeded, counter positions need
+		// to be updated to match the next current buffer position.
+		if !skipRetry {
+			b.retryCounts[b.itemsAdded] = count
+		}
 
 		if b.gzipw != nil {
-			gr, err = gzip.NewReader(bytes.NewReader(b.copyBuf))
-			if err != nil {
-				return resp, fmt.Errorf("failed to decompress request payload: %w", err)
+			// First loop, read from the gzip reader
+			if len(buf) == 0 {
+				n, err := gr.Read(buf[:cap(buf)])
+				if err != nil && err != io.EOF {
+					return resp, fmt.Errorf("failed to read from compressed buffer: %w", err)
+				}
+				buf = buf[:n]
 			}
-			defer gr.Close()
-		}
 
-		// keep track of the previous newlines
-		// the buffer is being read lazily
-		seen := 0
+			// newlines in the current buf
+			newlines := bytes.Count(buf, []byte{'\n'})
 
-		for _, res := range resp.FailedDocs {
-			if b.shouldRetryOnStatus(res.Status) {
-				// there are two lines for each document:
-				// - action
-				// - document
-				//
-				// Find the document by looking up the newline separators.
-				// First the newline (if exists) before the 'action' then the
-				// newline at the end of the 'document' line.
-				startln := res.Position * 2
-				endln := startln + 2
-
-				// Increment retry count for the positions found.
-				count := b.retryCounts[res.Position] + 1
-				// check if we are above the maxDocumentRetry setting
-				if count > b.config.MaxDocumentRetries {
-					// do not retry, return the document as failed
-					tmp = append(tmp, res)
-					continue
+			// loop until we've seen the start newline
+			for seen+newlines < startln {
+				// TODO: write to the success writer buf[:startIdx]
+				bytesWritten, _ := successTracker.Write(buf[:])
+				resp.FlushedSuccess += int64(bytesWritten)
+				seen += newlines
+				n, err := gr.Read(buf[:cap(buf)])
+				if err != nil && err != io.EOF {
+					return resp, fmt.Errorf("failed to read from compressed buffer: %w", err)
 				}
+				buf = buf[:n]
+				newlines = bytes.Count(buf, []byte{'\n'})
+			}
 
-				// Since some items may have succeeded, counter positions need
-				// to be updated to match the next current buffer position.
-				b.retryCounts[b.itemsAdded] = count
+			startIdx := indexnth(buf, startln-seen, '\n') + 1
+			endIdx := indexnth(buf, endln-seen, '\n') + 1
 
-				if b.gzipw != nil {
-					// First loop, read from the gzip reader
-					if len(buf) == 0 {
-						n, err := gr.Read(buf[:cap(buf)])
-						if err != nil && err != io.EOF {
-							return resp, fmt.Errorf("failed to read from compressed buffer: %w", err)
-						}
-						buf = buf[:n]
-					}
+			// TODO: write to the success writer buf[:startIdx]
+			bytesWritten, _ := successTracker.Write(buf[:startIdx])
+			resp.FlushedSuccess += int64(bytesWritten)
 
-					// newlines in the current buf
-					newlines := bytes.Count(buf, []byte{'\n'})
-
-					// loop until we've seen the start newline
-					for seen+newlines < startln {
-						seen += newlines
-						n, err := gr.Read(buf[:cap(buf)])
-						if err != nil && err != io.EOF {
-							return resp, fmt.Errorf("failed to read from compressed buffer: %w", err)
-						}
-						buf = buf[:n]
-						newlines = bytes.Count(buf, []byte{'\n'})
-					}
-
-					startIdx := indexnth(buf, startln-seen, '\n') + 1
-					endIdx := indexnth(buf, endln-seen, '\n') + 1
-
-					// If the end newline is not in the buffer read more data
-					if endIdx == 0 {
-						// Write what we have
-						b.writer.Write(buf[startIdx:])
-
-						// loop until we've seen the end newline
-						for seen+newlines < endln {
-							seen += newlines
-							n, err := gr.Read(buf[:cap(buf)])
-							if err != nil && err != io.EOF {
-								return resp, fmt.Errorf("failed to read from compressed buffer: %w", err)
-							}
-							buf = buf[:n]
-							newlines = bytes.Count(buf, []byte{'\n'})
-							if seen+newlines < endln {
-								// endln is not here, write what we have and keep going
-								b.writer.Write(buf)
-							}
-						}
-
-						// try again to find the end newline in the extra data
-						// we just read.
-						endIdx = indexnth(buf, endln-seen, '\n') + 1
-						b.writer.Write(buf[:endIdx])
-					} else {
-						// If the end newline is in the buffer write the event
-						b.writer.Write(buf[startIdx:endIdx])
-					}
-				} else {
-					startIdx := indexnth(b.copyBuf[lastIdx:], startln-lastln, '\n') + 1
-					endIdx := indexnth(b.copyBuf[lastIdx:], endln-lastln, '\n') + 1
-
-					b.writer.Write(b.copyBuf[lastIdx:][startIdx:endIdx])
-
-					lastln = endln
-					lastIdx += endIdx
-				}
-
-				resp.RetriedDocs++
-				b.itemsAdded++
-			} else {
+			if skipRetry {
 				// If it's not a retriable error, treat the document as failed
 				tmp = append(tmp, res)
+				continue
 			}
+
+			// If the end newline is not in the buffer read more data
+			if endIdx == 0 {
+				// Write what we have
+				b.writer.Write(buf[startIdx:])
+
+				// loop until we've seen the end newline
+				for seen+newlines < endln {
+					seen += newlines
+					n, err := gr.Read(buf[:cap(buf)])
+					if err != nil && err != io.EOF {
+						return resp, fmt.Errorf("failed to read from compressed buffer: %w", err)
+					}
+					buf = buf[:n]
+					newlines = bytes.Count(buf, []byte{'\n'})
+					if seen+newlines < endln {
+						// endln is not here, write what we have and keep going
+						b.writer.Write(buf)
+					}
+				}
+
+				// try again to find the end newline in the extra data
+				// we just read.
+				endIdx = indexnth(buf, endln-seen, '\n') + 1
+				b.writer.Write(buf[:endIdx])
+			} else {
+				// If the end newline is in the buffer write the event
+				b.writer.Write(buf[startIdx:endIdx])
+			}
+		} else {
+			startIdx := indexnth(b.copyBuf[lastIdx:], startln-lastln, '\n') + 1
+			endIdx := indexnth(b.copyBuf[lastIdx:], endln-lastln, '\n') + 1
+			if !skipRetry {
+				b.writer.Write(b.copyBuf[lastIdx:][startIdx:endIdx])
+			}
+			// TODO: count write to the success writer buf[:startIdx]
+			resp.FlushedSuccess += int64(len(b.copyBuf[lastIdx:][:startIdx]))
+			lastln = endln
+			lastIdx += endIdx
 		}
 
-		if len(tmp) > 0 {
-			resp.FailedDocs = tmp
+		if !skipRetry {
+			resp.RetriedDocs++
+			b.itemsAdded++
 		}
+	}
+
+	if len(tmp) > 0 {
+		resp.FailedDocs = tmp
 	}
 
 	return resp, nil

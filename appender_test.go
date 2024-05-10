@@ -295,6 +295,7 @@ loop:
 			metricdatatest.AssertHasAttributes(t, dp, attrs.ToSlice()...)
 			status, exist := dp.Attributes.Value(attribute.Key("status"))
 			assert.True(t, exist)
+			fmt.Println(status.AsString())
 			switch status.AsString() {
 			case "Success":
 				processedAsserted++
